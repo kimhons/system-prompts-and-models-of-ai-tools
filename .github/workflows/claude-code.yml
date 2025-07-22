@@ -1,0 +1,315 @@
+name: Claude Code Integration
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      claude_task:
+        description: 'Claude Code task to execute'
+        required: false
+        default: 'code_review'
+        type: choice
+        options:
+        - code_review
+        - documentation
+        - testing
+        - optimization
+        - security_scan
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+  issues: write
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  claude-code-analysis:
+    runs-on: ubuntu-latest
+    name: Claude Code Analysis
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install Dependencies
+      run: |
+        pip install anthropic requests
+    
+    - name: Claude Code Analysis
+      run: |
+        cat > claude_analysis.py << 'EOF'
+import os
+import anthropic
+import json
+from pathlib import Path
+
+def analyze_repository():
+    """Analyze repository with Claude"""
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+        
+        # Get repository structure
+        repo_files = []
+        for file_path in Path('.').rglob('*'):
+            if file_path.is_file() and not any(part.startswith('.') for part in file_path.parts):
+                if file_path.suffix in ['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.go', '.rs', '.php', '.md']:
+                    repo_files.append(str(file_path))
+        
+        # Limit to first 20 files for analysis
+        analysis_files = repo_files[:20]
+        
+        analysis_prompt = f"""
+        Analyze this repository and provide recommendations:
+        
+        Repository: {os.environ.get('GITHUB_REPOSITORY', 'Unknown')}
+        Files found: {len(repo_files)} total files
+        Analyzing: {analysis_files}
+        
+        Please provide a brief analysis covering:
+        1. Code structure and organization
+        2. Potential improvements
+        3. Security considerations
+        4. Documentation status
+        5. Testing recommendations
+        
+        Keep the response concise and actionable.
+        """
+        
+        message = client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=800,
+            messages=[{"role": "user", "content": analysis_prompt}]
+        )
+        
+        analysis = message.content[0].text
+        print("=== Claude Analysis ===")
+        print(analysis)
+        
+        # Save analysis
+        analysis_data = {
+            "repository": os.environ.get('GITHUB_REPOSITORY', 'Unknown'),
+            "timestamp": "$(date -Iseconds)",
+            "files_analyzed": len(analysis_files),
+            "total_files": len(repo_files),
+            "analysis": analysis
+        }
+        
+        with open('claude_analysis.json', 'w') as f:
+            json.dump(analysis_data, f, indent=2)
+        
+        print("Analysis saved to claude_analysis.json")
+        return True
+        
+    except Exception as e:
+        print(f"Error in Claude analysis: {e}")
+        # Create error report
+        with open('claude_analysis.json', 'w') as f:
+            json.dump({
+                "error": str(e),
+                "timestamp": "$(date -Iseconds)",
+                "repository": os.environ.get('GITHUB_REPOSITORY', 'Unknown')
+            }, f, indent=2)
+        return False
+
+if __name__ == "__main__":
+    analyze_repository()
+EOF
+        python claude_analysis.py
+    
+    - name: Claude Code Review (PR only)
+      if: github.event_name == 'pull_request'
+      run: |
+        cat > claude_review.py << 'EOF'
+import os
+import anthropic
+import subprocess
+
+def review_pull_request():
+    """Review pull request changes with Claude"""
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+        
+        # Get diff (limited to avoid token limits)
+        result = subprocess.run([
+            'git', 'diff', 
+            '${{ github.event.pull_request.base.sha }}', 
+            '${{ github.event.pull_request.head.sha }}'
+        ], capture_output=True, text=True)
+        
+        diff_content = result.stdout[:3000]  # Limit diff size
+        
+        if not diff_content.strip():
+            print("No changes to review")
+            return True
+        
+        review_prompt = f"""
+        Review this code diff and provide feedback:
+        
+        {diff_content}
+        
+        Focus on:
+        1. Code quality and best practices
+        2. Potential bugs or issues
+        3. Security concerns
+        4. Performance considerations
+        5. Suggestions for improvement
+        
+        Provide constructive, actionable feedback.
+        """
+        
+        message = client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": review_prompt}]
+        )
+        
+        review = message.content[0].text
+        print("=== Claude Code Review ===")
+        print(review)
+        
+        # Save review
+        with open('claude_review.md', 'w') as f:
+            f.write(f"# Claude Code Review\n\n{review}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error in Claude review: {e}")
+        return False
+
+if __name__ == "__main__":
+    review_pull_request()
+EOF
+        python claude_review.py
+    
+    - name: Upload Analysis Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: claude-analysis-${{ github.run_number }}
+        path: |
+          claude_analysis.json
+          claude_review.md
+        retention-days: 30
+    
+    - name: Comment on PR
+      if: github.event_name == 'pull_request' && hashFiles('claude_review.md') != ''
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          try {
+            if (fs.existsSync('claude_review.md')) {
+              const review = fs.readFileSync('claude_review.md', 'utf8');
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## 🤖 Claude Code Review\n\n${review}`
+              });
+            }
+          } catch (error) {
+            console.log('Error posting review comment:', error);
+          }
+
+  claude-security-check:
+    runs-on: ubuntu-latest
+    name: Claude Security Check
+    if: github.event_name == 'push'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install Dependencies
+      run: pip install anthropic
+    
+    - name: Claude Security Analysis
+      run: |
+        cat > claude_security.py << 'EOF'
+import os
+import anthropic
+from pathlib import Path
+
+def security_analysis():
+    """Perform security analysis with Claude"""
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+        
+        # Find configuration and potentially sensitive files
+        sensitive_patterns = ['config', 'env', '.env', 'secret', 'key', 'password', 'auth', 'credential']
+        sensitive_files = []
+        
+        for file_path in Path('.').rglob('*'):
+            if file_path.is_file():
+                file_str = str(file_path).lower()
+                if any(pattern in file_str for pattern in sensitive_patterns):
+                    sensitive_files.append(str(file_path))
+        
+        # Limit files for analysis
+        analysis_files = sensitive_files[:10]
+        
+        security_prompt = f"""
+        Perform a security analysis for this repository:
+        
+        Repository: {os.environ.get('GITHUB_REPOSITORY', 'Unknown')}
+        Potentially sensitive files found: {analysis_files}
+        
+        Check for common security issues:
+        1. Hardcoded secrets or API keys
+        2. Insecure configurations
+        3. Exposed sensitive data
+        4. Authentication weaknesses
+        5. General security best practices
+        
+        Provide specific, actionable security recommendations.
+        """
+        
+        message = client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=800,
+            messages=[{"role": "user", "content": security_prompt}]
+        )
+        
+        security_analysis = message.content[0].text
+        print("=== Claude Security Analysis ===")
+        print(security_analysis)
+        
+        # Save security analysis
+        with open('claude_security.md', 'w') as f:
+            f.write(f"# Claude Security Analysis\n\n{security_analysis}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error in security analysis: {e}")
+        return False
+
+if __name__ == "__main__":
+    security_analysis()
+EOF
+        python claude_security.py
+    
+    - name: Upload Security Analysis
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: claude-security-${{ github.run_number }}
+        path: claude_security.md
+        retention-days: 30
